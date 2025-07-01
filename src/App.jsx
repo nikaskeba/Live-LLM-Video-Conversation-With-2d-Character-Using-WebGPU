@@ -35,9 +35,13 @@ export default function App() {
   const micStreamRef = useRef(null);
   const node = useRef(null);
 useEffect(() => {
+  // 1) pull ctx from your ref
   const ctx = outputAudioContextRef.current;
-  if (!isSpeaking || !(visemeTimeline?.length > 0) || !ctx) return;
 
+  // 2) bail if nothing to do
+  if (!isSpeaking || visemeTimeline.length === 0 || !ctx) return;
+
+  // 3) now you can use ctx safely
   const startTime = ctx.currentTime;
   let rafId;
   const tick = () => {
@@ -104,15 +108,38 @@ useEffect(() => {
           }
           break;
         case "output":
-          if (!playing) {
-            node.current?.port.postMessage(data.result.audio);
-            setPlaying(true);
-            setIsSpeaking(true);
-            setIsListening(false);
-            setVisemeTimeline(data.phonemes);
-          }
-          break;
-      }
+  // 1) Play the audio chunk
+   node.current?.port.postMessage(data.result.audio);
+   setPlaying(true);
+   setIsSpeaking(true);
+   setIsListening(false);
+
+   // 2) Simulate a visemeTimeline from the raw phoneme string
+  // grab whatever tokens we got
+
+const phonemeStr = data.phonemes || "";
+const rawTokens  = tokenizeIPA(phonemeStr);
+
+// 2) map each to a viseme
+const ctx = outputAudioContextRef.current;
+  const slot = (ctx && rawTokens.length)
+    ? (data.result.audio.length / ctx.sampleRate) / rawTokens.length
+    : 0;
+ // 3) map each to a viseme
+ const timeline = rawTokens.map((tok, i) => ({
+   viseme: mapToShape(tok),
+   start:  slot * i,
+   end:    slot * (i + 1),
+ }));
+
+
+ if (ctx && rawTokens.length) {
+   setVisemeTimeline(squashTimeline(timeline));
+ } else {
+   setVisemeTimeline([]);
+ }
+    break;
+  }
     };
     const onError = (err) => setError(err.message);
 
@@ -124,20 +151,176 @@ useEffect(() => {
       worker.current.removeEventListener("error", onError);
     };
   }, []);
+  // strip any non-letter/digit, lowercase, fallback to 'rest'
+function tokenizeIPA(str = "") {
+  // 1) strip stress marks & punctuation
+  const clean = String(str)
+    .replace(/[ˈˌ.,?]/g, "")
+    .toLowerCase();
+
+  // 2) split on whitespace or commas into “chunks”
+  const chunks = clean.split(/[,\s]+/).filter(Boolean);
+
+  // 3) break each chunk into real phones
+  return chunks.flatMap(splitToPhones);
+}
+function cleanIPA(tok) {
+  return tok
+    // collapse length‐mark to a colon or remove if you prefer
+    .replace(/ː/g, ":")
+    // remove anything that isn’t a letter or colon
+    .replace(/[^a-zəʊɪæʌθðŋː:]/gi, "")
+    .toLowerCase();
+}
+function sanitizeViseme(viseme) {
+  if (!viseme) return 'rest';
+  return (
+    viseme
+      // remove stress markers & punctuation
+      .replace(/[ˈˌ.,?]/g, '')
+      // keep only a–z, 0–9, underscore
+      .replace(/[^a-z0-9]/gi, '_')
+      .toLowerCase() || 'rest'
+  );
+}
+const IPA_TO_SHAPE = {
+  // ── VOWELS & DIPHTHONGS ──
+  "aa": "AA",   // ɑː
+  "æ":  "AA",
+  "a":  "AA",
+
+  "e":  "EH",
+  "eh": "EH",
+  "eɪ": "EH",
+  "ɛ":  "EH",
+
+  // we don’t have a “IH” or “IY” shape, so map i-phones to EH
+  "i":  "EH",
+  "ɪ":  "EH",
+  "i:": "EH",
+  "iy": "EH",
+
+  "oʊ": "OO",
+  "ow":  "OO",
+
+  "u":  "UU",
+  "ʊ":  "UU",
+  "u:": "UU",
+
+  // you had UH tokens too; send them to rest
+  "ʌ":  "rest",
+  "ə":  "rest",
+  "uh": "rest",
+
+  // ── CONSONANTS ──
+  "p":  "PP",
+  "b":  "PP",
+  "m":  "PP",   // lips‐together
+
+  "f":  "FF",
+  "v":  "FF",
+
+  "θ":  "TH",
+  "ð":  "TH",
+
+  "t":  "TD",
+  "d":  "TD",
+
+  "s":  "SZ",
+  "z":  "SZ",
+
+  "ʃ":  "CH",
+  "ʒ":  "CH",
+  "tʃ": "CH",
+  "dʒ": "CH",
+
+  "k":  "KG",
+  "g":  "KG",
+  "ŋ":  "KG",
+
+  "l":  "L",
+  "ll": "LL",  // if you ever see a double-L token
+
+  "r":  "R",
+  "ɹ":  "R",
+
+  // these don’t move the lips in your set
+  "h":  "rest",
+  "w":  "rest",
+  "j":  "rest",
+};
+const ALL_IPA = Object.keys(IPA_TO_SHAPE)
+  .sort((a, b) => b.length - a.length);
+
+function splitToPhones(chunk) {
+  const phones = [];
+  let i = 0;
+  while (i < chunk.length) {
+    let matched = false;
+    for (const phone of ALL_IPA) {
+      if (chunk.slice(i, i + phone.length) === phone) {
+        phones.push(phone);
+        i += phone.length;
+        matched = true;
+        break;
+      }
+    }
+    if (!matched) {
+      // skip unknown char
+      i++;
+    }
+  }
+  return phones;
+}
+function squashTimeline(tl) {
+  if (!tl.length) return tl;
+  return tl.reduce((out, cur) => {
+    const prev = out[out.length - 1];
+    if (prev && prev.viseme === cur.viseme) {
+      // just extend the end
+      prev.end = cur.end;
+    } else {
+      out.push({ ...cur });
+    }
+    return out;
+  }, []);
+}
+function cleanTok(s) {
+  return ("" + s)
+    .toLowerCase()
+    // collapse common diacritics
+    .replace(/[ˈˌ]/g, "")
+    // map “j uː” style splits back together
+    .replace(/\s+/g, "")
+    // keep letters + these IPA symbols
+    .replace(/[^a-zːʃθʧɪə]/g, "");
+}
+
+function mapToShape(rawTok) {
+  const cleaned = cleanIPA(rawTok);
+  return IPA_TO_SHAPE[cleaned] || "rest";
+}
+// strip out diacritics/marks & lowercase
+function cleanToken(tok) {
+  // guard null and non-string
+  const s = tok == null ? "" : String(tok);
+
+  return s
+    .replace(/[ˈˌ.,?]/g, "")   // strip stress marks & punctuation
+    .replace(/[^A-Za-z]/g, "") // keep only letters
+    .toLowerCase();
+}
+
+
 function Character({ currentViseme }) {
+  const shape = currentViseme || "rest";  // you’ve already cleaned it
   return (
     <div className="relative w-48 h-48">
-      {/* face at the bottom */}
+      <img src="/assets/face.png" className="absolute inset-0 z-0" />
       <img
-        src="/assets/face.png"
-        alt="Head"
-        className="absolute inset-0 z-0 object-contain"
-      />
-      {/* mouth on top */}
-      <img
-        src={`/assets/mouth_${currentViseme || 'rest'}.png`}
-        alt={currentViseme}
-        className="absolute inset-0 z-10 object-contain"
+        src={`/assets/mouth_${shape}.png`}
+        className="absolute inset-0 z-10"
+        onError={e => (e.currentTarget.src = "/assets/mouth_rest.png")}
       />
     </div>
   );

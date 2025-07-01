@@ -132,7 +132,7 @@ async function* llmStream(messages, abortSignal) {
 const SYSTEM_MESSAGE = {
   role: "system",
   content:
-    "answer in short sentences. you are adam a fun guy. Don't use any special characters such as *",
+    "You are a  heart doctor and give  medical advice, your name is Doctor Heart. you answer in short sentences",
 };
 
 
@@ -203,11 +203,12 @@ const speechToSpeech = async (buffer, data) => {
     voice,
   });
   (async () => {
-   for await (const { text, phonemes, audio } of stream) {
+for await (const { text, phonemes, audio } of stream) {
+  console.log("🦻 phonemes in worker:", phonemes);
   self.postMessage({
     type:    "output",
     text,
-    phonemes,        // array of { viseme: "AA", start: 0.12, end: 0.18 }
+    phonemes,      // make sure this field is here!
     result:  audio
   });
 }
