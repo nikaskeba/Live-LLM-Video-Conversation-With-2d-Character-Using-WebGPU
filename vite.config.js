@@ -3,7 +3,8 @@ import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 
 // https://vite.dev/config/
-export default defineConfig({
+export default defineConfig(({ command }) => ({
+  base: command === "build" ? "/videochat/" : "/",  // 👈 base only in build
   plugins: [tailwindcss(), react()],
   build: {
     target: "esnext",
@@ -12,8 +13,6 @@ export default defineConfig({
     format: "es",
   },
   resolve: {
-    // Only bundle a single instance of Transformers.js
-    // (shared by `@huggingface/transformers` and `kokoro-js`)
     dedupe: ["@huggingface/transformers"],
   },
-});
+}));

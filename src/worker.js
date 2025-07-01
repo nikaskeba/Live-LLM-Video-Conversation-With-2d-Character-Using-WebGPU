@@ -1,4 +1,47 @@
 //worker.js
+const originalFetch = fetch.bind(self);
+
+globalThis.fetch = async (input, init) => {
+  // normalize to a URL string
+  const url = typeof input === "string" ? input : input.url;
+
+  // only intercept real model downloads (.onnx files)
+  if (!url.endsWith(".onnx")) {
+    // passthrough for everything else (LLM calls, splits, etc)
+    return originalFetch(input, init);
+  }
+
+  // otherwise do your chunked‐reader wrapper
+  const res     = await originalFetch(input, init);
+  const total   = Number(res.headers.get("content-length") || 0);
+  const reader  = res.body.getReader();
+  let   loaded  = 0;
+
+  const progressStream = new ReadableStream({
+    async start(controller) {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        loaded += value.byteLength;
+        self.postMessage({
+          type:    "progress",
+          loaded,
+          total,
+          // you can even format MB here
+          message: `Downloading model: ${(loaded/1024/1024).toFixed(1)} / ${(total/1024/1024).toFixed(1)} MB`
+        });
+        controller.enqueue(value);
+      }
+      controller.close();
+    },
+  });
+
+  return new Response(progressStream, {
+    headers:    res.headers,
+    status:     res.status,
+    statusText: res.statusText,
+  });
+};
 import {
   // VAD
   AutoModel,
@@ -12,7 +55,7 @@ import {
 } from "@huggingface/transformers";
 
 import { KokoroTTS, TextSplitterStream } from "kokoro-js";
-
+import { SCENARIOS } from "./scenarios";
 import {
   MAX_BUFFER_DURATION,
   INPUT_SAMPLE_RATE,
@@ -23,9 +66,32 @@ import {
   MIN_SILENCE_DURATION_SAMPLES,
   MIN_SPEECH_DURATION_SAMPLES,
 } from "./constants";
+const MODEL_STEPS = [
+  { name: "Loading TTS",     fn: () => KokoroTTS.from_pretrained(model_id, { dtype: "fp32", device }) },
+  { name: "Loading VAD",     fn: () => AutoModel.from_pretrained("onnx-community/silero-vad", { config: { model_type: "custom" }, dtype: "fp32" }) },
+  { name: "Loading ASR",     fn: () => pipeline("automatic-speech-recognition", "onnx-community/whisper-base", { device, dtype: DEVICE_DTYPE_CONFIGS[device] }) },
+];
 
+async function loadAllModels() {
+  for (let i = 0; i < MODEL_STEPS.length; i++) {
+    const { name, fn } = MODEL_STEPS[i];
+    self.postMessage({ type: "progress", loaded: i, total: MODEL_STEPS.length, message: name });
+    const result = await fn();
+    // assign back to your variables
+    if (name === "Loading TTS")    voice = result;       // rename as needed
+    if (name === "Loading VAD")    silero_vad = result;
+    if (name === "Loading ASR")    transcriber = result;
+  }
+  self.postMessage({ type: "progress", loaded: MODEL_STEPS.length, total: MODEL_STEPS.length, message: "All models loaded" });
+  // finally:
+  self.postMessage({ type: "status", status: "ready", voices: tts.voices });
+}
+
+// instead of doing each await at top, call:
+loadAllModels().catch(err => self.postMessage({ type:"error", error: err.message }));
 const model_id = "onnx-community/Kokoro-82M-v1.0-ONNX";
 let voice;
+self.postMessage({ type: "info", message: "Starting model downloads…" });
 const tts = await KokoroTTS.from_pretrained(model_id, {
   dtype: "fp32",
   device: "webgpu",
@@ -74,8 +140,9 @@ const transcriber = await pipeline(
 });
 
 await transcriber(new Float32Array(INPUT_SAMPLE_RATE)); // Compile shaders
-
-let LLM_URL   = "http://localhost:1234/v1/chat/completions";   // <- change me
+let currentSystemPrompt = SCENARIOS.interviewer.prompt;
+let currentGreet       = SCENARIOS.interviewer.greet;
+let LLM_URL   = "https://nodecodestudio.com/videochat/llm.php";   // <- change me
 let LLM_MODEL = "llama-3.2-3b-instruct";                                // <- change me
 let API_KEY   = "";                                      
 async function llmOnce(messages) {
@@ -129,14 +196,10 @@ async function* llmStream(messages, abortSignal) {
   }
 }
 
-const SYSTEM_MESSAGE = {
-  role: "system",
-  content:
-    "You are a  heart doctor and give  medical advice, your name is Doctor Heart. you answer in short sentences",
-};
+const makeSystem = () => ({ role: "system", content: currentSystemPrompt });
 
 
-let messages = [SYSTEM_MESSAGE];
+
 let past_key_values_cache;
 let stopping_criteria;
 self.postMessage({
@@ -195,8 +258,9 @@ const speechToSpeech = async (buffer, data) => {
     // If the transcription is empty or a blank audio, we skip the rest of the processing
     return;
   }
-  messages.push({ role: "user", content: text });
 
+  self.postMessage({ type: "transcription", text });
+  messages.push({ role: "user", content: text });
   // Set up text-to-speech streaming
   const splitter = new TextSplitterStream();
   const stream = tts.stream(splitter, {
@@ -267,76 +331,112 @@ const dispatchForTranscriptionAndResetAudioBuffer = (overflow) => {
   }
   resetAfterRecording(overflowLength);
 };
-
+let messages = [ makeSystem() ];
 let prevBuffers = [];
 self.onmessage = async (event) => {
-  const { type, buffer } = event.data;
-   // ---- custom setters from the frontend ----
- if (type === "set_endpoint") {
-   const { url } = event.data;
-   if (typeof url === "string" && url.trim()) {
-     LLM_URL = url.trim();
-     self.postMessage({ type: "status", status: "endpoint_set", message: `Endpoint: ${LLM_URL}` });
-   }
-   return;
- }
+  // 1) pull everything you might need from the frontend
+  const { type, buffer, url, key, model, voice: newVoice, scenario, custom } = event.data;
 
- if (type === "set_api_key") {
-   const { key } = event.data;
-   // allow empty to clear
-   if (typeof key === "string") {
-     API_KEY = key.trim();
-     self.postMessage({ type: "status", status: "api_key_set", message: API_KEY ? "API key set" : "API key cleared" });
-   }
-   return;
- }
- // --------------------------------------------
- if (type === "set_model") {
-    // only override if a non-empty string was passed
-    if (typeof event.data.model === "string" && event.data.model.trim()) {
-      LLM_MODEL = event.data.model;
+  // 2) endpoint override
+  if (type === "set_endpoint") {
+    if (typeof url === "string" && url.trim()) {
+      LLM_URL = url.trim();
       self.postMessage({
         type: "status",
-        status: "model_set",
-        message: `Using LLM model: ${LLM_MODEL}`
+        status: "endpoint_set",
+        message: `Endpoint: ${LLM_URL}`,
       });
     }
     return;
   }
-  // refuse new audio while playing back
+
+  // 3) api key override
+  if (type === "set_api_key") {
+    if (typeof key === "string") {
+      API_KEY = key.trim();
+      self.postMessage({
+        type: "status",
+        status: "api_key_set",
+        message: API_KEY ? "API key set" : "API key cleared",
+      });
+    }
+    return;
+  }
+
+  // 4) model override
+  if (type === "set_model") {
+    if (typeof model === "string" && model.trim()) {
+      LLM_MODEL = model.trim();
+      self.postMessage({
+        type: "status",
+        status: "model_set",
+        message: `Using LLM model: ${LLM_MODEL}`,
+      });
+    }
+    return;
+  }
+
+  // 5) voice override
+  if (type === "set_voice") {
+    if (typeof newVoice === "string") {
+      voice = newVoice;
+      self.postMessage({
+        type: "status",
+        status: "voice_set",
+        message: `Voice: ${voice}`,
+      });
+    }
+    return;
+  }
+
+  // 6) scenario override
+  if (type === "set_scenario" && SCENARIOS[scenario]) {
+    const basePrompt = SCENARIOS[scenario].prompt;
+    currentSystemPrompt = custom
+      ? `${basePrompt}\n${custom}`
+      : basePrompt;
+
+    currentGreet = SCENARIOS[scenario].greet;
+    messages = [{ role: "system", content: currentSystemPrompt }];
+
+    self.postMessage({
+      type:   "status",
+      status: "scenario_set",
+      message:`Scenario: ${SCENARIOS[scenario].label}`,
+    });
+    return;
+  }
+
+  // 7) refuse audio while TTS is playing
   if (type === "audio" && isPlaying) return;
 
+  // 8) core commands
   switch (type) {
-    case "start_call": {
-      const name = tts.voices[voice ?? "af_heart"]?.name ?? "Heart";
-      greet(`How can I help you today?`);
+    case "start_call":
+      // use the scenario‐specific greeting
+      greet(currentGreet);
       return;
-    }
+
     case "end_call":
-      messages = [SYSTEM_MESSAGE];
+      messages = [ { role: "system", content: currentSystemPrompt } ];
       past_key_values_cache = null;
+      return;
+
     case "interrupt":
-     stopping_criteria?.interrupt?.();
+      stopping_criteria?.interrupt?.();
       return;
-    case "set_voice":
-      voice = event.data.voice;
-      return;
+
     case "playback_ended":
       isPlaying = false;
       return;
   }
 
-  const wasRecording = isRecording; // Save current state
+  // 9) Voice activity detection + transcription logic
+  const wasRecording = isRecording;
   const isSpeech = await vad(buffer);
 
   if (!wasRecording && !isSpeech) {
-    // We are not recording, and the buffer is not speech,
-    // so we will probably discard the buffer. So, we insert
-    // into a FIFO queue with maximum size of PREV_BUFFER_SIZE
-    if (prevBuffers.length >= MAX_NUM_PREV_BUFFERS) {
-      // If the queue is full, we discard the oldest buffer
-      prevBuffers.shift();
-    }
+    if (prevBuffers.length >= MAX_NUM_PREV_BUFFERS) prevBuffers.shift();
     prevBuffers.push(buffer);
     return;
   }
@@ -400,8 +500,13 @@ function greet(text) {
   const splitter = new TextSplitterStream();
   const stream = tts.stream(splitter, { voice });
   (async () => {
-    for await (const { text: chunkText, audio } of stream) {
-      self.postMessage({ type: "output", text: chunkText, result: audio });
+    for await (const { text: chunkText, phonemes, audio } of stream) {
+      self.postMessage({
+        type:    "output",
+        text:    chunkText,
+        phonemes,
+        result:  audio,
+      });
     }
   })();
   splitter.push(text);

@@ -1,13 +1,16 @@
 import { useEffect, useState, useRef } from "react";
 import { Mic, PhoneOff, ChevronDown,  Settings  } from "lucide-react";
 import { INPUT_SAMPLE_RATE } from "./constants";
-
+import Character from "./Character";
 import WORKLET from "./play-worklet.js";
-
+import { SCENARIOS } from "./scenarios";     
 export default function App() {
+  const [loading, setLoading] = useState({ loaded: 0, total: 1, message: "Initializing…" });
+
   const [llmModel, setLlmModel] = useState("");  
   const outputAudioContextRef = useRef(null);
-  const contactName = "Anna";
+  const [scenarioInput, setScenarioInput] = useState("");
+  const contactName = "User";
   const isOutgoing = true;              // or false for incoming
   const directionIcon = isOutgoing
     ? <ChevronDown className="w-5 h-5 rotate-90 text-gray-500"/>
@@ -17,7 +20,8 @@ export default function App() {
   const [playing, setPlaying] = useState(false);
   const [llmUrl,    setLlmUrl]    = useState("");
   const [apiKey,    setApiKey]    = useState("");
-  const [voice, setVoice] = useState("af_heart");
+  const [voice, setVoice] = useState("af_jessica");
+  const [scenarioKey, setScenarioKey] = useState("interviewer");
   const [voices, setVoices] = useState([]);
   const [showSettings, setShowSettings] = useState(false);
   const [isListening, setIsListening] = useState(false);
@@ -29,11 +33,21 @@ export default function App() {
   const [currentViseme,  setCurrentViseme]  = useState(null);
   const [ready, setReady] = useState(false);
   const [error, setError] = useState(null);
+  const [transcript, setTranscript] = useState([]);
   const [elapsedTime, setElapsedTime] = useState("00:00");
+  const transcriptRef = useRef(null);
   const worker = useRef(null);
+// track loading steps from the worker
+ const [loadingProgress, setLoadingProgress] = useState({
+   loaded: 0,
+   total: 1,
+   message: "Initializing…",
+ });
 
   const micStreamRef = useRef(null);
   const node = useRef(null);
+  const cumulativeRef         = useRef(0);
+
 useEffect(() => {
   // 1) pull ctx from your ref
   const ctx = outputAudioContextRef.current;
@@ -56,6 +70,13 @@ useEffect(() => {
   return () => cancelAnimationFrame(rafId);
 }, [isSpeaking, visemeTimeline]);
   useEffect(() => {
+    const el = transcriptRef.current;
+    if (el) {
+      // jump to bottom
+      el.scrollTop = el.scrollHeight;
+    }
+  }, [transcript]);
+  useEffect(() => {
     worker.current?.postMessage({
       type: "set_voice",
       voice,
@@ -64,13 +85,16 @@ useEffect(() => {
 
   useEffect(() => {
     if (!callStarted) {
-      // Reset worker state after call ends
-      worker.current?.postMessage({
-        type: "end_call",
-      });
+      // 1) zero out your cumulative time
+      cumulativeRef.current = 0;
+
+      // 2) clear the viseme timeline so you start fresh
+      setVisemeTimeline([]);
+
+      // 3) tell the worker the call ended (so it resets too)
+      worker.current?.postMessage({ type: "end_call" });
     }
   }, [callStarted]);
-
   useEffect(() => {
     if (callStarted && callStartTime) {
       const interval = setInterval(() => {
@@ -91,6 +115,22 @@ useEffect(() => {
     });
 
     const onMessage = ({ data }) => {
+          // 1) handle our new progress events first
+        if (data.type === "transcription") {
+     setTranscript(t => [
+       ...t,
+       { role: "user", content: data.text.trim() }
+     ]);
+     return;
+   }
+    if (data.type === "progress") {
+       setLoadingProgress({
+         loaded: data.loaded,
+         total: data.total,
+         message: data.message,
+       });
+       return;
+     }
       if (data.error) {
         return onError(data.error);
       }
@@ -105,40 +145,62 @@ useEffect(() => {
           } else if (data.status === "ready") {
             setVoices(data.voices);
             setReady(true);
+             setLoadingProgress(null);
           }
           break;
-        case "output":
-  // 1) Play the audio chunk
-   node.current?.port.postMessage(data.result.audio);
-   setPlaying(true);
-   setIsSpeaking(true);
-   setIsListening(false);
+  case "output":
+  node.current?.port.postMessage(data.result.audio);
+  setPlaying(true);
+  setIsSpeaking(true);
 
-   // 2) Simulate a visemeTimeline from the raw phoneme string
-  // grab whatever tokens we got
+  const phonemeStr = data.phonemes || "";
+  const rawTokens  = tokenizeIPA(phonemeStr);
+  const ctx        = outputAudioContextRef.current;
+  if (!ctx || !rawTokens.length) return;
 
-const phonemeStr = data.phonemes || "";
-const rawTokens  = tokenizeIPA(phonemeStr);
+  // how many seconds this buffer is
+const chunkDur = data.result.audio.length / ctx.sampleRate;
+const slot     = chunkDur / rawTokens.length;
 
-// 2) map each to a viseme
-const ctx = outputAudioContextRef.current;
-  const slot = (ctx && rawTokens.length)
-    ? (data.result.audio.length / ctx.sampleRate) / rawTokens.length
-    : 0;
- // 3) map each to a viseme
- const timeline = rawTokens.map((tok, i) => ({
-   viseme: mapToShape(tok),
-   start:  slot * i,
-   end:    slot * (i + 1),
- }));
+  // build this chunk’s timeline, offset by cumulativeRef.current
+const chunkTimeline = rawTokens.map((tok,i) => ({
+  viseme: mapToShape(tok),
+  start:  cumulativeRef.current + slot * i,
+  end:    cumulativeRef.current + slot * (i + 1),
+}));
 
+  // bump your cumulative offset
+  cumulativeRef.current += chunkDur;
+    const chunk = data.text || "";
+  setTranscript(t => {
+    const last = t[t.length - 1];
+    if (last?.role === "assistant") {
+      // 1) Does the existing text end in whitespace or end-of-sentence punctuation?
+      const endsWithSpace    = /\s$/.test(last.content);
+      // 2) Does the new chunk already start with whitespace?
+      const startsWithSpace  = /^\s/.test(chunk);
+      // 3) If neither, inject exactly one space
+      const separator = endsWithSpace || startsWithSpace ? "" : " ";
 
- if (ctx && rawTokens.length) {
-   setVisemeTimeline(squashTimeline(timeline));
- } else {
-   setVisemeTimeline([]);
- }
-    break;
+      return [
+        // everything up to—but not including—the last message
+        ...t.slice(0, -1),
+        // re-push the merged assistant message
+        {
+          role: "assistant",
+          content: last.content + separator + chunk
+        }
+      ];
+    }
+    // First assistant message ever
+    return [...t, { role: "assistant", content: chunk }];
+  });
+  // append & squash
+setVisemeTimeline(old =>
+  squashTimeline([...old, ...chunkTimeline])
+
+);
+  break;
   }
     };
     const onError = (err) => setError(err.message);
@@ -151,6 +213,8 @@ const ctx = outputAudioContextRef.current;
       worker.current.removeEventListener("error", onError);
     };
   }, []);
+
+
   // strip any non-letter/digit, lowercase, fallback to 'rest'
 function tokenizeIPA(str = "") {
   // 1) strip stress marks & punctuation
@@ -312,19 +376,7 @@ function cleanToken(tok) {
 }
 
 
-function Character({ currentViseme }) {
-  const shape = currentViseme || "rest";  // you’ve already cleaned it
-  return (
-    <div className="relative w-48 h-48">
-      <img src="/assets/face.png" className="absolute inset-0 z-0" />
-      <img
-        src={`/assets/mouth_${shape}.png`}
-        className="absolute inset-0 z-10"
-        onError={e => (e.currentTarget.src = "/assets/mouth_rest.png")}
-      />
-    </div>
-  );
-}
+
   useEffect(() => {
     if (!callStarted) return;
   const ctx = new AudioContext({ sampleRate: 24000 });
@@ -397,13 +449,19 @@ function Character({ currentViseme }) {
           "buffered-audio-worklet-processor",
         );
 
-        node.current.port.onmessage = (event) => {
-          if (event.data.type === "playback_ended") {
-            setPlaying(false);
-            setIsSpeaking(false);
-            worker.current?.postMessage({ type: "playback_ended" });
-          }
-        };
+ node.current.port.onmessage = (event) => {
+  if (event.data.type === "playback_ended") {
+    setPlaying(false);
+    setIsSpeaking(false);
+    // force the mouth back to “rest”
+    setCurrentViseme("rest");
+    // (optional) clear out any old timeline
+    setVisemeTimeline([]);
+    // let the worker know too
+    cumulativeRef.current = 0;
+    worker.current?.postMessage({ type: "playback_ended" });
+  }
+};
 
         const outputAnalyser = outputAudioContext.createAnalyser();
         outputAnalyser.fftSize = 256;
@@ -470,7 +528,11 @@ function Character({ currentViseme }) {
         },
       });
       micStreamRef.current = stream;
-
+  worker.current?.postMessage({
+    type:     "set_scenario",
+    scenario: scenarioKey,
+    custom:   scenarioInput.trim(),
+  });
       setCallStartTime(Date.now());
       setCallStarted(true);
       worker.current?.postMessage({ type: "start_call" });
@@ -479,8 +541,31 @@ function Character({ currentViseme }) {
       console.error(err);
     }
   };
+const bgFile = callStarted
+  ? SCENARIOS[scenarioKey].background
+  : "camera_off.png";
+console.log("🖼️ bgFile:", bgFile, "→ url('/assets/"+bgFile+"')");
+if (loadingProgress) {
+  const percent = loadingProgress.total
+    ? (loadingProgress.loaded / loadingProgress.total) * 100
+    : 0;
 
-
+  return (
+    <div className="fixed inset-0 bg-white flex flex-col items-center justify-center z-50 p-4">
+      <div className="mb-2 text-lg">{loadingProgress.message}</div>
+      <div className="w-64 bg-gray-200 rounded overflow-hidden">
+        <div
+          className="h-2 bg-green-500"
+          style={{ width: `${percent.toFixed(1)}%` }}
+        />
+      </div>
+      <div className="mt-2 text-sm">
+        {(loadingProgress.loaded / 1024 / 1024).toFixed(1)} MB /{" "}
+        {(loadingProgress.total / 1024 / 1024).toFixed(1)} MB
+      </div>
+    </div>
+  );
+}
   return (
     <div className="h-screen flex items-center justify-center bg-gray-50 p-4">
       <div
@@ -535,10 +620,20 @@ function Character({ currentViseme }) {
           <span className="text-lg font-medium">{elapsedTime}</span>
         </div>
 
-        {/* ─── MAIN ─── */}
-        <div className="flex-1 flex items-center justify-center p-4">
-          <Character currentViseme={currentViseme} />
-        </div>
+  {/* ─── MAIN ─── */}
+
+ <div
+   className="flex-1 p-4 min-h-[12rem] bg-cover bg-center relative"
+   style={{ backgroundImage: `url('/assets/${bgFile}')` }}
+ >
+   {callStarted && (
+     <div
+       className="absolute inset-0 flex items-end justify-center pointer-events-none"
+     >
+       <Character currentViseme={currentViseme} />
+     </div>
+   )}
+ </div>
 
         {/* ─── FOOTER ─── */}
         <div className="flex items-center justify-between px-6 py-4 border-t">
@@ -550,7 +645,22 @@ function Character({ currentViseme }) {
             <Settings className="w-6 h-6 text-gray-600" />
           </button>
 
-  
+        <div className="flex items-center space-x-2">
+            {/* Scenario dropdown */}
+          <select
+   value={scenarioKey}
+   onChange={e => setScenarioKey(e.target.value)}
+   disabled={callStarted}
+   className={`
+     border rounded px-2 py-1
+     ${callStarted ? 'opacity-50 cursor-not-allowed' : ''}
+   `}
+ >
+              {Object.entries(SCENARIOS).map(([key, s]) => (
+                <option key={key} value={key}>{s.label}</option>
+              ))}
+            </select>
+          </div>
 
           {/* Call button */}
           {callStarted ? (
@@ -628,7 +738,64 @@ function Character({ currentViseme }) {
             </div>
           </div>
         )}
+        <div className="px-6 py-2 space-y-2">
+  <label className="block text-sm font-medium">
+    {SCENARIOS[scenarioKey].inputLabel}
+  </label>
+  <input
+    type="text"
+    value={scenarioInput}
+    onChange={e => setScenarioInput(e.target.value)}
+    placeholder={SCENARIOS[scenarioKey].inputPlaceholder}
+    className="w-full border rounded px-2 py-1"
+  />
+</div>
+              {/* ─── TRANSCRIPT BOX ─── */}
+<div className="px-6 py-4 border-t bg-gray-50">
+  <h3 className="font-semibold mb-2">Transcript</h3>
+<div
+  ref={transcriptRef}
+  className="overflow-y-auto max-h-40 p-2 bg-white rounded border"
+>
+    {transcript.map((m, i) => (
+      <div
+        key={i}
+        className={m.role === "user" ? "text-blue-600" : "text-green-700"}
+      >
+        <strong>{m.role === "user" ? contactName : "AI"}:</strong>{" "}
+        {m.content}
       </div>
+    ))}
+  </div>
+  <button
+    onClick={() => {
+      const txt = transcript
+        .map(
+          m =>
+            `${m.role === "user" ? contactName : "AI"}: ${m.content}`
+        )
+        .join("\n");
+      const blob = new Blob([txt], { type: "text/plain" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "transcript.txt";
+      a.click();
+      URL.revokeObjectURL(url);
+    }}
+    className="mt-2 px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700"
+  >
+    Download Transcript
+  </button>
+  <button
+  onClick={() => setTranscript([])}
+  className="mt-2 ml-2 px-4 py-2 bg-red-100 text-red-700 rounded hover:bg-red-200"
+>
+  Reset
+</button>
+</div>
+      </div>
+
     </div>
   );
 }
